@@ -55,11 +55,16 @@ impl ZipWriter {
 
         let mut buf = Vec::new();
         let header_size = write_local_file_header(&mut buf, &file).unwrap();
-
         self.sender.send_data(Bytes::from(buf)).await?;
         self.sender.send_data(Bytes::from(compressed_data)).await?;
+        let mut buf = Vec::new();
+        let data_descriptor_size = write_data_descriptor(&mut buf, &file).unwrap();
+        self.sender.send_data(Bytes::from(buf)).await?;
 
-        self.bytes_written = self.bytes_written + header_size + compressed_size;
+        self.bytes_written = self.bytes_written
+            + header_size
+            + data_descriptor_size
+            + compressed_size;
         self.file_metadata.push(file);
 
         Ok(())
@@ -120,7 +125,7 @@ fn write_local_file_header<W: std::io::Write>(
     writer.write_u16::<LittleEndian>(0x0014)?;
 
     // flags
-    writer.write_u16::<LittleEndian>(0)?;
+    writer.write_u16::<LittleEndian>(1 << 3)?; // bit 3 indicates data descriptors in use
 
     // compression method
     writer.write_u16::<LittleEndian>(8)?; // 8 = deflate
@@ -132,13 +137,13 @@ fn write_local_file_header<W: std::io::Write>(
     writer.write_u16::<LittleEndian>(0)?; // TODO
 
     // crc-32
-    writer.write_u32::<LittleEndian>(file.crc32)?;
+    writer.write_u32::<LittleEndian>(0)?;
 
     // compressed size
-    writer.write_u32::<LittleEndian>(file.compressed_size)?;
+    writer.write_u32::<LittleEndian>(0)?;
 
     // uncompressed size
-    writer.write_u32::<LittleEndian>(file.uncompressed_size)?;
+    writer.write_u32::<LittleEndian>(0)?;
 
     // file name length
     let file_name = file.file_name.as_bytes();
@@ -152,6 +157,33 @@ fn write_local_file_header<W: std::io::Write>(
     // extra field TODO
 
     Ok(30 + file_name.len() as u32)
+}
+
+/*
+   4.3.9  Data descriptor:
+
+        signature                       4 bytes (0x08074b50)
+        crc-32                          4 bytes
+        compressed size                 4 bytes
+        uncompressed size               4 bytes
+ */
+fn write_data_descriptor<W: std::io::Write>(
+    writer: &mut W,
+    file: &FileMetadata,
+) -> std::io::Result<u32> {
+    // local file header signature
+    writer.write_u32::<LittleEndian>(0x08074b50)?;
+
+    // crc-32
+    writer.write_u32::<LittleEndian>(file.crc32)?;
+
+    // compressed size
+    writer.write_u32::<LittleEndian>(file.compressed_size)?;
+
+    // uncompressed size
+    writer.write_u32::<LittleEndian>(file.uncompressed_size)?;
+
+    Ok(16)
 }
 
 /*
@@ -203,7 +235,7 @@ fn write_central_directory_header<W: std::io::Write>(
     writer.write_u16::<LittleEndian>(0x0014)?;
 
     // flags
-    writer.write_u16::<LittleEndian>(0)?;
+    writer.write_u16::<LittleEndian>(1 << 3)?; // bit 3 indicates data descriptors in use
 
     // compression method
     writer.write_u16::<LittleEndian>(8)?; // 8 = deflate
