@@ -16,61 +16,121 @@ struct FileMetadata {
     file_name: String,
 }
 
+struct CurrentFileState {
+    file_metadata: FileMetadata,
+    hasher: Hasher,
+    encoder: DeflateEncoder<Vec<u8>>,
+}
+
 pub struct ZipWriter {
     sender: Sender,
     file_metadata: Vec<FileMetadata>,
     bytes_written: u32,
+    current_file_state: Option<CurrentFileState>,
 }
 
+/**
+    write a multifile zip file to the given Sender.
+
+    for each file:
+    - call start_file once
+    - then call write for each chunk of the file data
+    - then call finish_file once
+
+    files must be written sequentially (ie don't interleave calls to the above functions)
+
+    when all files are done:
+    - call finish
+*/
 impl ZipWriter {
     pub fn new(sender: Sender) -> Self {
         Self {
             sender,
             file_metadata: Vec::new(),
             bytes_written: 0,
+            current_file_state: None,
         }
     }
 
-    pub async fn write_file(&mut self, file_name: &str, file_data: &[u8]) -> Result<(), hyper::Error> {
-        let offset = self.bytes_written;
-        let uncompressed_size = file_data.len() as u32;
+    /**  */
+    pub async fn start_file(&mut self, file_name: &str) -> Result<(), hyper::Error> {
+        if let Some(_) = self.current_file_state {
+            panic!("call finish_file before starting a new file");
+        }
 
-        // compute crc32
-        let mut hasher = Hasher::new();
-        hasher.update(file_data);
-        let crc32 = hasher.finalize();
-
-        // compress the data
-        let mut encoder = DeflateEncoder::new(
-            Vec::new(),
-            Compression::default()
-        );
-        encoder.write_all(file_data).unwrap();
-        let compressed_data = encoder.finish().unwrap();
-        let compressed_size = compressed_data.len() as u32;
-
-        let file = FileMetadata {
-            crc32, uncompressed_size, compressed_size, offset, file_name: file_name.into(),
+        let file_metadata = FileMetadata {
+            crc32: 0,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            offset: self.bytes_written,
+            file_name: file_name.into(),
         };
 
         let mut buf = Vec::new();
-        let header_size = write_local_file_header(&mut buf, &file).unwrap();
-        self.sender.send_data(Bytes::from(buf)).await?;
-        self.sender.send_data(Bytes::from(compressed_data)).await?;
-        let mut buf = Vec::new();
-        let data_descriptor_size = write_data_descriptor(&mut buf, &file).unwrap();
+        let header_size = write_local_file_header(&mut buf, &file_metadata).unwrap();
         self.sender.send_data(Bytes::from(buf)).await?;
 
-        self.bytes_written = self.bytes_written
-            + header_size
-            + data_descriptor_size
-            + compressed_size;
-        self.file_metadata.push(file);
+        self.current_file_state = Some(CurrentFileState {
+            file_metadata,
+            hasher: Hasher::new(),
+            encoder: DeflateEncoder::new(
+                Vec::new(),
+                Compression::default()
+            )
+        });
+
+        self.bytes_written = self.bytes_written + header_size;
 
         Ok(())
     }
 
-    pub async fn finish(&mut self) -> Result<(), hyper::Error> {
+    /** write part or all of file data */
+    pub async fn write(&mut self, buf: &[u8]) -> Result<(), hyper::Error> {
+        if let Some(CurrentFileState {
+                     file_metadata,
+                     hasher,
+                     encoder
+                 }) = &mut self.current_file_state {
+
+            hasher.update(buf);
+            encoder.write_all(buf);
+            file_metadata.uncompressed_size = file_metadata.uncompressed_size + buf.len() as u32;
+
+            return Ok(())
+        }
+
+        panic!("cannot write until start_file is called")
+    }
+
+    /** complete the writing of a file */
+    pub async fn finish_file(&mut self) -> Result<(), hyper::Error> {
+        let current_file_state = std::mem::take(&mut self.current_file_state).unwrap();
+
+        // compute crc32
+        let crc32 = current_file_state.hasher.finalize();
+
+        // compress the data
+        let compressed_data = current_file_state.encoder.finish().unwrap();
+        let compressed_size = compressed_data.len() as u32;
+
+        self.sender.send_data(Bytes::from(compressed_data)).await?;
+
+        let mut file_metadata = current_file_state.file_metadata;
+        file_metadata.crc32 = crc32;
+        file_metadata.compressed_size = compressed_size;
+
+        let mut buf = Vec::new();
+        let data_descriptor_size = write_data_descriptor(&mut buf, &file_metadata).unwrap();
+        self.sender.send_data(Bytes::from(buf)).await?;
+
+        self.bytes_written = self.bytes_written + compressed_size + data_descriptor_size;
+        self.file_metadata.push(file_metadata);
+
+        Ok(())
+    }
+
+    /** complete the zip file by writing out the central directory. consumes self */
+    pub async fn finish(mut self) -> Result<(), hyper::Error> {
         let offset = self.bytes_written;
 
         for file in self.file_metadata.iter() {
@@ -89,8 +149,6 @@ impl ZipWriter {
             size,
         ).unwrap();
         self.sender.send_data(Bytes::from(buf)).await?;
-
-        println!("finished!");
 
         Ok(())
     }

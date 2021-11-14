@@ -9,8 +9,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use std::str::FromStr;
 use std::io::{Write, SeekFrom};
-use hyper::body::Bytes;
+use hyper::body::{Bytes, Buf};
 use zip::ZipWriter;
+use std::borrow::BorrowMut;
+use futures::StreamExt;
 
 #[derive(Clone, Debug, Deserialize)]
 struct ZipRequestEntry {
@@ -24,23 +26,27 @@ async fn zip_request_handler(req: Request<Body>) -> Result<Response<Body>, hyper
     let bytes = hyper::body::to_bytes(req).await?;
 
     if let Ok(zip_request) = serde_json::from_slice::<ZipRequest>(&bytes) {
-        println!("{:?}", zip_request);
-
         let (sender, body) = Body::channel();
 
         tokio::spawn(async move {
             let mut zip = ZipWriter::new(sender);
 
             for entry in zip_request {
-                println!("downloading {:?} from {:?}", entry.filename, entry.url);
+                zip.start_file(&entry.filename).await.unwrap();
+
                 let uri = Uri::from_str(&entry.url).unwrap();
                 let https = hyper_tls::HttpsConnector::new();
                 let client = hyper::client::Client::builder()
                     .build::<_,hyper::Body>(https);
-                let res = client.get(uri).await.unwrap();
-                let buf = hyper::body::to_bytes(res).await.unwrap();
-                println!("writing {:?}", entry.filename);
-                zip.write_file(&entry.filename, &buf).await;
+
+                let mut res = client.get(uri).await.unwrap();
+                let mut body = res.body_mut();
+
+                while let Some(buf) = body.next().await {
+                    zip.write(&buf.unwrap()).await.unwrap();
+                }
+
+                zip.finish_file().await.unwrap();
             }
 
             zip.finish().await;
