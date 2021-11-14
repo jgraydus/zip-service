@@ -39,14 +39,12 @@ curl http://localhost:3000/ \
   -H "Content-Type: application/json" \
   > archive.zip
 ```
-
 ## Design notes
 Each request may require downloading many files. In order to keep the memory footprint of the server small, the
 files are downloaded sequentially and streamed through the zip writer and into the HTTP response.
 
-
 ## TODO
-- Implement more of the zip spec, in particular zip64 extensions and different compression options
-- the encoder holds on to all of the compressed data for a file, even though we're writing the compressed blocks
-  as they get generated. this means that lots of memory would be required for very large files. so it would be
-  a good idea to figure out how to discard the unneeded data
+- write tests
+- add better error handling
+- reduce allocations
+- implement more of the zip spec, in particular zip64 extensions and different compression options

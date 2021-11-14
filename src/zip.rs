@@ -17,7 +17,7 @@ struct CurrentFileState {
     file_metadata: FileMetadata,
     hasher: Hasher,
     encoder: DeflateEncoder<Vec<u8>>,
-    bytes_written_for_file: usize,
+    compressed_size: usize,
 }
 
 /**
@@ -79,7 +79,7 @@ impl ZipWriter {
                 Vec::new(),
                 Compression::default()
             ),
-            bytes_written_for_file: 0,
+            compressed_size: 0,
         });
 
         self.bytes_written = self.bytes_written + header_size;
@@ -93,7 +93,7 @@ impl ZipWriter {
                         file_metadata,
                         hasher,
                         encoder,
-                        bytes_written_for_file,
+                        compressed_size
                  }) = &mut self.current_file_state {
 
             file_metadata.uncompressed_size = file_metadata.uncompressed_size + buf.len() as u32;
@@ -102,16 +102,11 @@ impl ZipWriter {
             hasher.update(buf);
 
             // compress the given chunk of data and write the new blocks to the response
-            let _ = encoder.write_all(buf);
-
-            /* this part is a bit tricky. in order to get at the newly compressed blocks, access
-            the Vec that the encoder is writing to and grab a slice of everything beyond the last
-            byte that was written for the current file. then update bytes_written_for_file for
-            the next time */
-            let new_data = &encoder.get_ref().as_slice()[*bytes_written_for_file as usize..];
-            *bytes_written_for_file = *bytes_written_for_file + new_data.len();
-            // TODO any way to avoid copying when writing from slices?
-            self.sender.send_data(Bytes::copy_from_slice(new_data)).await?;
+            encoder.write_all(buf).unwrap();
+            // grab the Vec that the encoder is writing into, replacing it with an empty Vec
+            let vec = std::mem::take(encoder.get_mut());
+            *compressed_size = *compressed_size + vec.len();
+            self.sender.send_data(Bytes::from(vec)).await?;
 
             return Ok(())
         }
@@ -126,13 +121,11 @@ impl ZipWriter {
         // finished checksum
         let crc32 = current_file_state.hasher.finalize();
 
-        // compress the data
-        let compressed_data = current_file_state.encoder.finish().unwrap();
-        let compressed_size = compressed_data.len() as u32;
-
-        // only need to write the data that hasn't been written previously (in the write method)
-        let unwritten_data = &compressed_data[current_file_state.bytes_written_for_file..];
-        self.sender.send_data(Bytes::copy_from_slice(unwritten_data)).await?;
+        // finalize the encoder. this flushes the encoder's internal buffer and so might return
+        // some data that hasn't been written to the response yet
+        let remaining_data = current_file_state.encoder.finish().unwrap();
+        let compressed_size = (current_file_state.compressed_size + remaining_data.len()) as u32;
+        self.sender.send_data(Bytes::from(remaining_data)).await?;
 
         // data descriptor needs crc32, compressed_size, and uncompressed_size
         // uncompressed size is updated in the write method after each chunk of the file is written
