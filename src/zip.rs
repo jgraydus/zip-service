@@ -17,6 +17,7 @@ struct CurrentFileState {
     file_metadata: FileMetadata,
     hasher: Hasher,
     encoder: DeflateEncoder<Vec<u8>>,
+    bytes_written_for_file: usize,
 }
 
 /**
@@ -31,6 +32,9 @@ files must be written sequentially (ie don't interleave calls to the above funct
 
 when all files are done:
 - call finish
+
+TODO implement zip64 extensions
+TODO reduce copying and allocation
  */
 pub struct ZipWriter {
     sender: Sender,
@@ -63,6 +67,7 @@ impl ZipWriter {
             file_name: file_name.into(),
         };
 
+        // TODO avoid this buffer or buffer without allocation
         let mut buf = Vec::new();
         let header_size = write_local_file_header(&mut buf, &file_metadata).unwrap();
         self.sender.send_data(Bytes::from(buf)).await?;
@@ -74,6 +79,7 @@ impl ZipWriter {
                 Vec::new(),
                 Compression::default()
             ),
+            bytes_written_for_file: 0,
         });
 
         self.bytes_written = self.bytes_written + header_size;
@@ -84,20 +90,28 @@ impl ZipWriter {
     /** write part or all of file data */
     pub async fn write(&mut self, buf: &[u8]) -> Result<(), hyper::Error> {
         if let Some(CurrentFileState {
-                     file_metadata,
-                     hasher,
-                     encoder,
+                        file_metadata,
+                        hasher,
+                        encoder,
+                        bytes_written_for_file,
                  }) = &mut self.current_file_state {
 
             file_metadata.uncompressed_size = file_metadata.uncompressed_size + buf.len() as u32;
 
+            // update the checksum
             hasher.update(buf);
-            /* TODO
-             * Currently, all data for a file is written into the encoder and sent to the
-             * http response stream only once the file is finished. There should be a way to read
-             * the newly encoded blocks here and send them to the http response stream.
-             */
+
+            // compress the given chunk of data and write the new blocks to the response
             let _ = encoder.write_all(buf);
+
+            /* this part is a bit tricky. in order to get at the newly compressed blocks, access
+            the Vec that the encoder is writing to and grab a slice of everything beyond the last
+            byte that was written for the current file. then update bytes_written_for_file for
+            the next time */
+            let new_data = &encoder.get_ref().as_slice()[*bytes_written_for_file as usize..];
+            *bytes_written_for_file = *bytes_written_for_file + new_data.len();
+            // TODO any way to avoid copying when writing from slices?
+            self.sender.send_data(Bytes::copy_from_slice(new_data)).await?;
 
             return Ok(())
         }
@@ -109,19 +123,24 @@ impl ZipWriter {
     pub async fn finish_file(&mut self) -> Result<(), hyper::Error> {
         let current_file_state = std::mem::take(&mut self.current_file_state).unwrap();
 
-        // compute crc32
+        // finished checksum
         let crc32 = current_file_state.hasher.finalize();
 
         // compress the data
         let compressed_data = current_file_state.encoder.finish().unwrap();
         let compressed_size = compressed_data.len() as u32;
 
-        self.sender.send_data(Bytes::from(compressed_data)).await?;
+        // only need to write the data that hasn't been written previously (in the write method)
+        let unwritten_data = &compressed_data[current_file_state.bytes_written_for_file..];
+        self.sender.send_data(Bytes::copy_from_slice(unwritten_data)).await?;
 
+        // data descriptor needs crc32, compressed_size, and uncompressed_size
+        // uncompressed size is updated in the write method after each chunk of the file is written
         let mut file_metadata = current_file_state.file_metadata;
         file_metadata.crc32 = crc32;
         file_metadata.compressed_size = compressed_size;
 
+        // TODO avoid this buffer or buffer without allocation
         let mut buf = Vec::new();
         let data_descriptor_size = write_data_descriptor(&mut buf, &file_metadata).unwrap();
         self.sender.send_data(Bytes::from(buf)).await?;
@@ -137,6 +156,7 @@ impl ZipWriter {
         let offset = self.bytes_written;
 
         for file in self.file_metadata.iter() {
+            // TODO avoid this buffer or buffer without allocation
             let mut buf = Vec::new();
             let bytes_written = write_central_directory_header(&mut buf, file).unwrap();
             self.sender.send_data(Bytes::from(buf)).await?;
@@ -144,6 +164,7 @@ impl ZipWriter {
         }
         let size = self.bytes_written - offset;
 
+        // TODO avoid this buffer or buffer without allocation
         let mut buf = Vec::new();
         write_end_of_central_directory_record(
             &mut buf,

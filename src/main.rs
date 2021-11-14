@@ -43,7 +43,7 @@ async fn zip_request_handler(req: Request<Body>) -> Result<Response<Body>, hyper
 
                 debug!("writing file {}", entry.filename);
                 while let Some(buf) = body.next().await {
-                    trace!("writing buffer");
+                    trace!("writing next piece of file");
                     zip.write(&buf.unwrap()).await.unwrap();
                 }
 
