@@ -1,12 +1,9 @@
-#![allow(unused)]
 use podio::{LittleEndian, WritePodExt};
 use crc32fast::Hasher;
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use std::io::Write;
-use tokio::fs::File;
 use hyper::body::{Sender, Bytes};
-use std::borrow::Borrow;
 
 struct FileMetadata {
     crc32: u32,
@@ -22,6 +19,19 @@ struct CurrentFileState {
     encoder: DeflateEncoder<Vec<u8>>,
 }
 
+/**
+write a multifile zip file to the given Sender.
+
+for each file:
+- call start_file once
+- then call write for each chunk of the file data
+- then call finish_file once
+
+files must be written sequentially (ie don't interleave calls to the above functions)
+
+when all files are done:
+- call finish
+ */
 pub struct ZipWriter {
     sender: Sender,
     file_metadata: Vec<FileMetadata>,
@@ -29,19 +39,6 @@ pub struct ZipWriter {
     current_file_state: Option<CurrentFileState>,
 }
 
-/**
-    write a multifile zip file to the given Sender.
-
-    for each file:
-    - call start_file once
-    - then call write for each chunk of the file data
-    - then call finish_file once
-
-    files must be written sequentially (ie don't interleave calls to the above functions)
-
-    when all files are done:
-    - call finish
-*/
 impl ZipWriter {
     pub fn new(sender: Sender) -> Self {
         Self {
@@ -52,7 +49,7 @@ impl ZipWriter {
         }
     }
 
-    /**  */
+    /** prepares state to start writing data for a file and writes the local file header */
     pub async fn start_file(&mut self, file_name: &str) -> Result<(), hyper::Error> {
         if let Some(_) = self.current_file_state {
             panic!("call finish_file before starting a new file");
@@ -76,7 +73,7 @@ impl ZipWriter {
             encoder: DeflateEncoder::new(
                 Vec::new(),
                 Compression::default()
-            )
+            ),
         });
 
         self.bytes_written = self.bytes_written + header_size;
@@ -89,12 +86,18 @@ impl ZipWriter {
         if let Some(CurrentFileState {
                      file_metadata,
                      hasher,
-                     encoder
+                     encoder,
                  }) = &mut self.current_file_state {
 
-            hasher.update(buf);
-            encoder.write_all(buf);
             file_metadata.uncompressed_size = file_metadata.uncompressed_size + buf.len() as u32;
+
+            hasher.update(buf);
+            /* TODO
+             * Currently, all data for a file is written into the encoder and sent to the
+             * http response stream only once the file is finished. There should be a way to read
+             * the newly encoded blocks here and send them to the http response stream.
+             */
+            let _ = encoder.write_all(buf);
 
             return Ok(())
         }
