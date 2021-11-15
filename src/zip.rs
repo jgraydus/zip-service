@@ -17,7 +17,6 @@ struct CurrentFileState {
     file_metadata: FileMetadata,
     hasher: Hasher,
     encoder: DeflateEncoder<Vec<u8>>,
-    compressed_size: usize,
 }
 
 /**
@@ -79,7 +78,6 @@ impl ZipWriter {
                 Vec::new(),
                 Compression::default()
             ),
-            compressed_size: 0,
         });
 
         self.bytes_written = self.bytes_written + header_size;
@@ -93,7 +91,6 @@ impl ZipWriter {
                         file_metadata,
                         hasher,
                         encoder,
-                        compressed_size
                  }) = &mut self.current_file_state {
 
             file_metadata.uncompressed_size = file_metadata.uncompressed_size + buf.len() as u32;
@@ -103,10 +100,13 @@ impl ZipWriter {
 
             // compress the given chunk of data and write the new blocks to the response
             encoder.write_all(buf).unwrap();
-            // grab the Vec that the encoder is writing into, replacing it with an empty Vec
-            let vec = std::mem::take(encoder.get_mut());
-            *compressed_size = *compressed_size + vec.len();
-            self.sender.send_data(Bytes::from(vec)).await?;
+
+            // swap out the encoder's buffer
+            let encoder_buf = std::mem::take(encoder.get_mut());
+            file_metadata.compressed_size = file_metadata.compressed_size + encoder_buf.len() as u32;
+
+            // send the compressed data
+            self.sender.send_data(Bytes::from(encoder_buf)).await?;
 
             return Ok(())
         }
@@ -117,28 +117,23 @@ impl ZipWriter {
     /** complete the writing of a file */
     pub async fn finish_file(&mut self) -> Result<(), hyper::Error> {
         let current_file_state = std::mem::take(&mut self.current_file_state).unwrap();
+        let mut file_metadata = current_file_state.file_metadata;
 
         // finished checksum
-        let crc32 = current_file_state.hasher.finalize();
+        file_metadata.crc32 = current_file_state.hasher.finalize();
 
         // finalize the encoder. this flushes the encoder's internal buffer and so might return
         // some data that hasn't been written to the response yet
         let remaining_data = current_file_state.encoder.finish().unwrap();
-        let compressed_size = (current_file_state.compressed_size + remaining_data.len()) as u32;
+        file_metadata.compressed_size = file_metadata.compressed_size + remaining_data.len() as u32;
         self.sender.send_data(Bytes::from(remaining_data)).await?;
-
-        // data descriptor needs crc32, compressed_size, and uncompressed_size
-        // uncompressed size is updated in the write method after each chunk of the file is written
-        let mut file_metadata = current_file_state.file_metadata;
-        file_metadata.crc32 = crc32;
-        file_metadata.compressed_size = compressed_size;
 
         // TODO avoid this buffer or buffer without allocation
         let mut buf = Vec::new();
         let data_descriptor_size = write_data_descriptor(&mut buf, &file_metadata).unwrap();
         self.sender.send_data(Bytes::from(buf)).await?;
 
-        self.bytes_written = self.bytes_written + compressed_size + data_descriptor_size;
+        self.bytes_written = self.bytes_written + file_metadata.compressed_size + data_descriptor_size;
         self.file_metadata.push(file_metadata);
 
         Ok(())
